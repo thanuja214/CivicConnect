@@ -44,6 +44,30 @@ async function initializeDatabase() {
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
   `);
+
+  await pool.query(`
+    ALTER TABLE complaints
+    ADD COLUMN IF NOT EXISTS type VARCHAR(50) DEFAULT 'Complaint',
+    ADD COLUMN IF NOT EXISTS location VARCHAR(255),
+    ADD COLUMN IF NOT EXISTS image_data TEXT;
+  `);
+
+  if (process.env.ADMIN_EMAIL && process.env.ADMIN_PASSWORD) {
+    const email = process.env.ADMIN_EMAIL.toLowerCase().trim();
+    const hashedPassword = await bcrypt.hash(
+      process.env.ADMIN_PASSWORD,
+      10
+    );
+
+    await pool.query(
+      `INSERT INTO users (full_name, email, password, role)
+       VALUES ('Administrator', $1, $2, 'admin')
+       ON CONFLICT (email)
+       DO UPDATE SET password = $2, role = 'admin'`,
+      [email, hashedPassword]
+    );
+  }
+
   console.log("PostgreSQL database ready");
 }
 
@@ -58,22 +82,58 @@ function authenticate(req, res, next) {
     req.user = jwt.verify(token, SECRET);
     next();
   } catch {
-    res.status(401).json({ message: "Invalid or expired token" });
+    return res.status(401).json({
+      message: "Invalid or expired token"
+    });
   }
 }
 
 function adminOnly(req, res, next) {
   if (req.user.role !== "admin") {
-    return res.status(403).json({ message: "Admin access required" });
+    return res.status(403).json({
+      message: "Admin access required"
+    });
   }
   next();
 }
 
+function createToken(user) {
+  return jwt.sign(
+    {
+      id: user.id,
+      email: user.email,
+      role: user.role
+    },
+    SECRET,
+    { expiresIn: "1d" }
+  );
+}
+
+function formatComplaint(row) {
+  return {
+    id: row.complaint_id,
+    dbId: row.id,
+    owner: row.email,
+    ownerName: row.full_name,
+    type: row.type,
+    category: row.category,
+    subject: row.title,
+    title: row.title,
+    location: row.location,
+    description: row.description,
+    image: row.image_data,
+    status: row.status,
+    date: row.created_at
+  };
+}
+
 app.get("/api/health", (req, res) => {
-  res.json({ message: "CivicConnect backend is running" });
+  res.json({
+    message: "CivicConnect backend is running"
+  });
 });
 
-// Registration
+// Register
 app.post("/api/auth/register", async (req, res) => {
   try {
     const { fullName, email, password } = req.body;
@@ -84,25 +144,39 @@ app.post("/api/auth/register", async (req, res) => {
       });
     }
 
+    const cleanEmail = email.toLowerCase().trim();
     const hashedPassword = await bcrypt.hash(password, 10);
 
     const result = await pool.query(
       `INSERT INTO users (full_name, email, password)
        VALUES ($1, $2, $3)
        RETURNING id, full_name, email, role`,
-      [fullName.trim(), email.toLowerCase().trim(), hashedPassword]
+      [fullName.trim(), cleanEmail, hashedPassword]
     );
+
+    const user = result.rows[0];
 
     res.status(201).json({
       message: "Registration successful",
-      user: result.rows[0]
+      token: createToken(user),
+      user: {
+        id: user.id,
+        fullName: user.full_name,
+        email: user.email,
+        role: user.role
+      }
     });
   } catch (error) {
     if (error.code === "23505") {
-      return res.status(409).json({ message: "Email already registered" });
+      return res.status(409).json({
+        message: "Email already registered"
+      });
     }
+
     console.error(error);
-    res.status(500).json({ message: "Registration failed" });
+    res.status(500).json({
+      message: "Registration failed"
+    });
   }
 });
 
@@ -117,25 +191,23 @@ app.post("/api/auth/login", async (req, res) => {
     );
 
     if (!result.rows.length) {
-      return res.status(401).json({ message: "Invalid email or password" });
+      return res.status(401).json({
+        message: "Invalid email or password"
+      });
     }
 
     const user = result.rows[0];
-    const valid = await bcrypt.compare(password, user.password);
+    const valid = await bcrypt.compare(password || "", user.password);
 
     if (!valid) {
-      return res.status(401).json({ message: "Invalid email or password" });
+      return res.status(401).json({
+        message: "Invalid email or password"
+      });
     }
-
-    const token = jwt.sign(
-      { id: user.id, email: user.email, role: user.role },
-      SECRET,
-      { expiresIn: "1d" }
-    );
 
     res.json({
       message: "Login successful",
-      token,
+      token: createToken(user),
       user: {
         id: user.id,
         fullName: user.full_name,
@@ -145,39 +217,68 @@ app.post("/api/auth/login", async (req, res) => {
     });
   } catch (error) {
     console.error(error);
-    res.status(500).json({ message: "Login failed" });
+    res.status(500).json({
+      message: "Login failed"
+    });
   }
 });
 
 // Submit complaint
 app.post("/api/complaints", authenticate, async (req, res) => {
   try {
-    const { title, category, description } = req.body;
+    const {
+      title,
+      subject,
+      type,
+      category,
+      location,
+      description,
+      image,
+      image_data
+    } = req.body;
 
-    if (!title || !description) {
+    const complaintTitle = title || subject;
+
+    if (!complaintTitle || !description) {
       return res.status(400).json({
-        message: "Title and description are required"
+        message: "Subject and description are required"
       });
     }
 
-    const complaintId =
-      "CC" + Date.now().toString().slice(-10);
+    const complaintId = "CC" + Date.now().toString().slice(-10);
 
     const result = await pool.query(
       `INSERT INTO complaints
-       (complaint_id, user_id, title, category, description)
-       VALUES ($1, $2, $3, $4, $5)
+       (complaint_id, user_id, title, category, description,
+        type, location, image_data)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
        RETURNING *`,
-      [complaintId, req.user.id, title, category || "General", description]
+      [
+        complaintId,
+        req.user.id,
+        complaintTitle,
+        category || "General",
+        description,
+        type || "Complaint",
+        location || "",
+        image || image_data || null
+      ]
     );
 
     res.status(201).json({
       message: "Complaint submitted successfully",
-      complaint: result.rows[0]
+      complaint: {
+        ...result.rows[0],
+        id: result.rows[0].complaint_id,
+        subject: result.rows[0].title,
+        image: result.rows[0].image_data
+      }
     });
   } catch (error) {
     console.error(error);
-    res.status(500).json({ message: "Complaint submission failed" });
+    res.status(500).json({
+      message: "Complaint submission failed"
+    });
   }
 });
 
@@ -195,22 +296,64 @@ app.get("/api/complaints", authenticate, async (req, res) => {
       `);
     } else {
       result = await pool.query(
-        `SELECT * FROM complaints
-         WHERE user_id = $1
-         ORDER BY created_at DESC`,
+        `SELECT c.*, u.full_name, u.email
+         FROM complaints c
+         JOIN users u ON c.user_id = u.id
+         WHERE c.user_id = $1
+         ORDER BY c.created_at DESC`,
         [req.user.id]
       );
     }
 
-    res.json(result.rows);
+    res.json(result.rows.map(formatComplaint));
   } catch (error) {
     console.error(error);
-    res.status(500).json({ message: "Unable to load complaints" });
+    res.status(500).json({
+      message: "Unable to load complaints"
+    });
   }
 });
 
-// Update complaint status (admin only)
-app.patch("/api/complaints/:id/status",
+// Track a complaint
+app.get("/api/complaints/track/:complaintId", authenticate, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT c.*, u.full_name, u.email
+       FROM complaints c
+       JOIN users u ON c.user_id = u.id
+       WHERE c.complaint_id = $1`,
+      [req.params.complaintId]
+    );
+
+    if (!result.rows.length) {
+      return res.status(404).json({
+        message: "Complaint not found"
+      });
+    }
+
+    const complaint = result.rows[0];
+
+    if (
+      req.user.role !== "admin" &&
+      complaint.user_id !== req.user.id
+    ) {
+      return res.status(403).json({
+        message: "You cannot view this complaint"
+      });
+    }
+
+    res.json(formatComplaint(complaint));
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({
+      message: "Unable to track complaint"
+    });
+  }
+});
+
+// Update complaint status
+app.patch(
+  "/api/complaints/:id/status",
   authenticate,
   adminOnly,
   async (req, res) => {
@@ -219,19 +362,23 @@ app.patch("/api/complaints/:id/status",
       const allowed = ["Pending", "In Progress", "Resolved"];
 
       if (!allowed.includes(status)) {
-        return res.status(400).json({ message: "Invalid status" });
+        return res.status(400).json({
+          message: "Invalid status"
+        });
       }
 
       const result = await pool.query(
         `UPDATE complaints
          SET status = $1, updated_at = CURRENT_TIMESTAMP
-         WHERE id = $2
+         WHERE complaint_id = $2
          RETURNING *`,
         [status, req.params.id]
       );
 
       if (!result.rows.length) {
-        return res.status(404).json({ message: "Complaint not found" });
+        return res.status(404).json({
+          message: "Complaint not found"
+        });
       }
 
       res.json({
@@ -240,12 +387,14 @@ app.patch("/api/complaints/:id/status",
       });
     } catch (error) {
       console.error(error);
-      res.status(500).json({ message: "Status update failed" });
+      res.status(500).json({
+        message: "Status update failed"
+      });
     }
   }
 );
 
-// Serve existing frontend files
+// Serve frontend files
 app.use(express.static(path.join(__dirname, "..")));
 
 app.get("/", (req, res) => {
